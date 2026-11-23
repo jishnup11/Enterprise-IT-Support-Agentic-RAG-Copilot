@@ -1,6 +1,6 @@
 # Enterprise IT Support Agentic RAG Copilot
 
-An end-to-end **Forward Deployed Engineer (FDE) project** that turns a notebook-style Agentic RAG workflow into a deployable internal product using **LangGraph, FastAPI, Pinecone, Gemini, Tavily, HTML, CSS, and JavaScript**.
+An end-to-end **Forward Deployed Engineer (FDE) project** that turns a notebook-style Agentic RAG workflow into a deployable internal product using **LangGraph, FastAPI, Pinecone, Groq, Tavily, HTML, CSS, and JavaScript**.
 
 ---
 
@@ -185,7 +185,7 @@ The system therefore controls **what to do next** based on its current state.
 | Layer | Technology | Purpose |
 |---|---|---|
 | Agent workflow | LangGraph | Stateful routing and conditional decisions |
-| LLM | Gemini | Routing, grading, rewriting, answer generation |
+| LLM | Groq | Routing, grading, rewriting, answer generation |
 | Embeddings | HuggingFace `all-MiniLM-L6-v2` | Local 384-dimensional embeddings |
 | Vector DB | Pinecone | Private enterprise knowledge base |
 | External search | Tavily | Fallback when company KB is insufficient |

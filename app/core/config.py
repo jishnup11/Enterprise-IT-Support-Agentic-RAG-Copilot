@@ -9,6 +9,7 @@ class Settings(BaseSettings):
     app_env: str = "development"
     # openai_api_key: str = ""
     google_api_key: str = ""
+    gemini_api_key: str = ""
     tavily_api_key: str = ""
     pinecone_api_key: str = ""
     pinecone_index_name: str = "fde-it-support-rag"

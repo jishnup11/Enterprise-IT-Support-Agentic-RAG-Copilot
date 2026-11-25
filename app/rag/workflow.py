@@ -1,5 +1,6 @@
 import logging
-from typing import Literal
+from pathlib import Path
+from typing import Any, Literal
 
 from langchain_openai import ChatOpenAI
 from langchain_google_genai import ChatGoogleGenerativeAI
@@ -57,6 +58,50 @@ def web_search_tool():
 def add_trace(state: AgentState, message: str):
     return [*state.get("trace", []), message]
 
+
+def extract_text_content(value: Any) -> str:
+    """Normalize LangChain/Gemini message payloads into a clean plain-text string."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if hasattr(value, "content"):
+        return extract_text_content(value.content)
+    if isinstance(value, list):
+        parts: list[str] = []
+        for item in value:
+            if isinstance(item, dict):
+                block_type = str(item.get("type", "")).lower()
+                if block_type in {"thinking", "reasoning"}:
+                    continue
+                if item.get("text") is not None:
+                    text = extract_text_content(item["text"])
+                elif item.get("content") is not None:
+                    text = extract_text_content(item["content"])
+                else:
+                    text = ""
+            else:
+                text = extract_text_content(item)
+            if text:
+                parts.append(text)
+        return "\n".join(parts).strip()
+    if isinstance(value, dict):
+        block_type = str(value.get("type", "")).lower()
+        if block_type in {"thinking", "reasoning"}:
+            return ""
+        for key in ("text", "content", "answer", "output", "response"):
+            if value.get(key) is not None:
+                return extract_text_content(value[key])
+        return ""
+    return str(value).strip()
+
+
+def _extract_field(result: Any, field: str, allowed: tuple[str, ...], default: str) -> str:
+    """Safely read a structured output field from either a Pydantic model or dict."""
+    value = result.get(field) if isinstance(result, dict) else getattr(result, field, None)
+    return value if value in allowed else default
+
+
 def route_question(state: AgentState):
     router = llm().with_structured_output(RouteDecision, method="json_mode")
     decision = router.invoke(f"""
@@ -67,7 +112,8 @@ Use direct only for greetings, thanks, or casual chat that needs no company know
 Question: {state['question']}
 Return valid JSON like {{"route":"kb"}}.
 """)
-    return {"source_used": decision.route, "trace": add_trace(state, f"Router → {decision.route.upper()}")}
+    route = _extract_field(decision, "route", ("kb", "direct"), "kb")
+    return {"source_used": route, "trace": add_trace(state, f"Router → {route.upper()}")}
 
 def route_after_router(state: AgentState) -> Literal["retrieve_kb", "direct_answer"]:
     return "retrieve_kb" if state["source_used"] == "kb" else "direct_answer"
@@ -86,7 +132,8 @@ Private company KB evidence:\n{context}
 Return good only if the evidence is sufficient to answer confidently and specifically.
 Otherwise return weak. JSON: {{"grade":"good"}} or {{"grade":"weak"}}.
 """)
-    return {"kb_grade": grade.grade, "trace": add_trace(state, f"KB evidence grade → {grade.grade.upper()}")}
+    kb_grade = _extract_field(grade, "grade", ("good", "weak"), "weak")
+    return {"kb_grade": kb_grade, "trace": add_trace(state, f"KB evidence grade → {kb_grade.upper()}")}
 
 def after_kb(state: AgentState) -> Literal["generate_from_kb", "search_web"]:
     return "generate_from_kb" if state["kb_grade"] == "good" else "search_web"
@@ -94,15 +141,26 @@ def after_kb(state: AgentState) -> Literal["generate_from_kb", "search_web"]:
 def search_web(state: AgentState):
     result = web_search_tool().invoke({"query": state["current_query"]})
     lines, citations = [], []
+    items = []
     if isinstance(result, dict):
         if result.get("answer"):
-            lines.append("Search answer: " + result["answer"])
-        for item in result.get("results", []):
-            title, url, content = item.get("title", ""), item.get("url", ""), item.get("content", "")
-            lines.append(f"Title: {title}\nURL: {url}\nContent: {content}")
-            citations.append({"title": title or url, "url": url, "type": "web"})
+            lines.append("Search answer: " + extract_text_content(result["answer"]))
+        items = result.get("results", [])
+    elif isinstance(result, list):
+        items = result
     else:
-        lines.append(str(result))
+        lines.append(extract_text_content(result))
+
+    for item in items:
+        if isinstance(item, dict):
+            title = str(item.get("title") or "")
+            url = str(item.get("url") or "")
+            content = str(item.get("content") or "")
+            lines.append(f"Title: {title}\nURL: {url}\nContent: {content}")
+            citations.append({"title": title or url or "Web result", "url": url, "type": "web"})
+        else:
+            lines.append(extract_text_content(item))
+
     return {
         "web_results": "\n\n".join(lines),
         "citations": citations,
@@ -118,7 +176,8 @@ Web evidence:\n{state['web_results']}
 Return good if the evidence is sufficient and directly relevant; otherwise weak.
 Return valid JSON like {{"grade":"good"}}.
 """)
-    return {"web_grade": grade.grade, "trace": add_trace(state, f"Web evidence grade → {grade.grade.upper()}")}
+    web_grade = _extract_field(grade, "grade", ("good", "weak"), "weak")
+    return {"web_grade": web_grade, "trace": add_trace(state, f"Web evidence grade → {web_grade.upper()}")}
 
 def after_web(state: AgentState) -> Literal["generate_from_web", "rewrite_query", "insufficient"]:
     if state["web_grade"] == "good":
@@ -128,11 +187,12 @@ def after_web(state: AgentState) -> Literal["generate_from_web", "rewrite_query"
     return "insufficient"
 
 def rewrite_query(state: AgentState):
-    rewritten = llm().invoke(f"""
+    response = llm().invoke(f"""
 Rewrite this IT support question for better private knowledge retrieval and vendor web search.
 Preserve intent, add useful technical keywords, do not answer, return only the query.
 Question: {state['question']}
-""").content.strip()
+""")
+    rewritten = extract_text_content(response) or state["current_query"]
     return {
         "current_query": rewritten,
         "retry_count": state["retry_count"] + 1,
@@ -141,31 +201,38 @@ Question: {state['question']}
 
 def generate_from_kb(state: AgentState):
     context = "\n\n".join(f"[Source: {d.metadata.get('source','unknown')}]\n{d.page_content}" for d in state["kb_docs"])
-    answer = llm().invoke(f"""
+    response = llm().invoke(f"""
 You are an enterprise IT support copilot. Answer ONLY from the private company KB below.
 Be concise, actionable, and safe. If steps are present, present them clearly.
 Do not invent policy details. Mention that the answer is based on the company's private knowledge base.
 Question: {state['question']}\n\nPrivate KB:\n{context}
-""").content
+""")
+    answer = extract_text_content(response) or (
+        "I found relevant internal documentation, but could not generate a formatted response. Please contact the IT help desk."
+    )
     citations = []
     seen = set()
     for d in state["kb_docs"]:
-        src = d.metadata.get("source", "Private KB")
+        src = str(d.metadata.get("source") or "Private KB")
         if src not in seen:
             seen.add(src)
-            citations.append({"title": src.split("/")[-1], "url": "", "type": "private_kb"})
+            citations.append({"title": Path(src).name or src, "url": "", "type": "private_kb"})
     return {"answer": answer, "source_used": "private_kb", "citations": citations, "trace": add_trace(state, "Answer generation → PRIVATE KB")}
 
 def generate_from_web(state: AgentState):
-    answer = llm().invoke(f"""
+    response = llm().invoke(f"""
 You are an enterprise IT support copilot. The private company KB was insufficient.
 Answer ONLY from the web evidence below. Clearly say this is external web information and may need IT validation before changing company-managed systems.
 Question: {state['question']}\n\nWeb evidence:\n{state['web_results']}
-""").content
+""")
+    answer = extract_text_content(response) or (
+        "I found external web results, but could not generate a formatted response. Please review the sources or contact the IT help desk."
+    )
     return {"answer": answer, "source_used": "web_search", "trace": add_trace(state, "Answer generation → WEB SEARCH")}
 
 def direct_answer(state: AgentState):
-    answer = llm().invoke(f"Respond briefly and naturally to: {state['question']}").content
+    response = llm().invoke(f"Respond briefly and naturally to: {state['question']}")
+    answer = extract_text_content(response) or "Hello! How can I help you with IT support today?"
     return {"answer": answer, "source_used": "direct", "trace": add_trace(state, "Direct response → no retrieval")}
 
 def insufficient(state: AgentState):
@@ -226,4 +293,6 @@ def ask(question: str):
         "trace": [],
         "citations": [],
     }
-    return agent_graph.invoke(initial)
+    result = agent_graph.invoke(initial)
+    result["answer"] = extract_text_content(result.get("answer"))
+    return result
